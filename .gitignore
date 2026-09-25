@@ -1,0 +1,7 @@
+.env
+browser-profile/
+output/
+__pycache__/
+# Job descriptions you search with: client material, keep out of git
+*.txt
+!requirements.txt
