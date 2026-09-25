@@ -13,7 +13,7 @@ Setup, once (PowerShell, in this folder):
 Run:
     python search.py jd.txt                      top 20, Best Fit
     python search.py jd.txt --count 25 --mode Exact
-    python search.py jd.txt --headless           no browser window (after the first login)
+    python search.py jd.txt --show               show the browser (first login, or to watch it)
 
 The login is kept in browser-profile/ between runs. The Excel file goes to output/.
 """
@@ -150,7 +150,7 @@ def log_in(page: Page, headless: bool) -> None:
     except PlaywrightTimeout:
         sys.exit(
             "Login did not complete. Check EXCELHIRE_EMAIL / EXCELHIRE_PASSWORD in .env, or run "
-            "once without --headless and log in in the window."
+            "once with --show and log in in the window."
         )
 
 
@@ -355,7 +355,9 @@ def main() -> None:
     parser.add_argument("jd_file", type=Path, help="text file holding the job description")
     parser.add_argument("--count", type=int, default=20, help="profiles to save (max 25)")
     parser.add_argument("--mode", choices=SEARCH_MODES, default="Best Fit")
-    parser.add_argument("--headless", action="store_true", help="run without a browser window")
+    parser.add_argument(
+        "--show", action="store_true", help="show the browser window (hidden by default)"
+    )
     args = parser.parse_args()
 
     jd = args.jd_file.read_text(encoding="utf-8").strip()
@@ -369,10 +371,10 @@ def main() -> None:
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch_persistent_context(
-            PROFILE_FOLDER, headless=args.headless, viewport={"width": 1600, "height": 900}
+            PROFILE_FOLDER, headless=not args.show, viewport={"width": 1600, "height": 900}
         )
         page = browser.pages[0] if browser.pages else browser.new_page()
-        open_external_search(page, app_url, args.headless)
+        open_external_search(page, app_url, headless=not args.show)
         credits_before = available_credits(page)
         total = run_search(page, jd, args.mode)
         candidates = read_candidates(page, args.count)
