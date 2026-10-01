@@ -5,3 +5,6 @@ __pycache__/
 # Job descriptions you search with: client material, keep out of git
 *.txt
 !requirements.txt
+
+# Local Python environment
+.venv/

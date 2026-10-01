@@ -68,6 +68,7 @@ the scraper reads only that page. Ask for more and you still get 25.
 | `--mode "Skill Match"` | Ranks on skills |
 | `--count 10` | How many profiles to save: 1 to 25, default 20 (see above) |
 | `--show` | Show the browser window (it runs hidden by default). Use it if the login needs a code, or to watch a run |
+| `--csv out.csv` | Also write the LeadOps CSV (see below) |
 
 ## The result
 
@@ -80,6 +81,33 @@ An Excel file in `output/`, named after the JD and the time, with two sheets:
 
 The file holds people's personal data: keep it on your PC, share it only with people who need it,
 and delete it when the role is closed. `output/` is git-ignored.
+
+## Use from LeadOps (or any program)
+
+LeadOps Studio runs this scraper in the background from its Upload page. Three things make that
+work, and none of them change the normal run:
+
+- **`--csv <path>`** also writes a CSV in the shape LeadOps imports, one row per candidate:
+  `first_name, last_name, linkedin_url, location, company, skills, experience, education,
+  match_score, match_reasons`. The name is split on the first space (`Y Rajesh` → `Y`, `Rajesh`).
+  There is no email or phone column: they sit behind Reveal, which is never clicked.
+  ```powershell
+  python search.py jd.txt --mode Exact --csv output\leads.csv
+  ```
+- **Progress lines**: each step prints one line as it starts, so a program can show live
+  progress: `PROGRESS opening`, `PROGRESS logging_in` (only when a login is needed),
+  `PROGRESS parsing`, `PROGRESS searching`, `PROGRESS reading 3/20`, `PROGRESS saving`,
+  `PROGRESS done`.
+- **Exit codes** say how the run ended:
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Done |
+  | 1 | Bad input: the JD file is missing or too short |
+  | 2 | Login did not complete |
+  | 3 | The results table has changed (nothing saved) |
+  | 4 | Files saved, but the credit counter changed during the run |
+  | 5 | Excel Hire did not answer in time |
 
 ## If something goes wrong
 

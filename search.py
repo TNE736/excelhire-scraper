@@ -14,13 +14,18 @@ Run:
     python search.py jd.txt                      top 20, Best Fit
     python search.py jd.txt --count 25 --mode Exact
     python search.py jd.txt --show               show the browser (first login, or to watch it)
+    python search.py jd.txt --csv out.csv        also write the LeadOps CSV (see CSV_COLUMNS)
 
 The login is kept in browser-profile/ between runs. The Excel file goes to output/.
+
+For programs that run it (LeadOps): each step prints a `PROGRESS <step>` line as it starts, and
+the exit code says how it ended (see EXIT_CODES).
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import re
 import sys
@@ -38,6 +43,31 @@ from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 HERE = Path(__file__).resolve().parent
+
+# How a run ends, for programs that start it. Printed messages stay the same for people.
+EXIT_CODES = {
+    "ok": 0,
+    "bad_input": 1,  # missing JD file, JD too short
+    "login_failed": 2,
+    "table_changed": 3,  # Excel Hire changed its results table; nothing was saved
+    "credits_changed": 4,  # files were saved, but the credit counter moved during the run
+    "timed_out": 5,  # Excel Hire did not answer in time
+}
+
+# The LeadOps CSV (--csv): one row per candidate, columns in this order. No email or phone:
+# they sit behind Reveal, which this scraper never clicks.
+CSV_COLUMNS = (
+    "first_name",
+    "last_name",
+    "linkedin_url",
+    "location",
+    "company",
+    "skills",
+    "experience",
+    "education",
+    "match_score",
+    "match_reasons",
+)
 PROFILE_FOLDER = HERE / "browser-profile"  # keeps the login between runs
 OUTPUT_FOLDER = HERE / "output"
 
@@ -98,6 +128,19 @@ LINK_COLOR = "1D4ED8"
 TOP_LEFT = Alignment(wrap_text=True, vertical="top")
 
 
+class RunStopped(Exception):
+    """Ends the run with one of EXIT_CODES and a message for the person reading the console."""
+
+    def __init__(self, outcome: str, message: str):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def progress(step: str) -> None:
+    """One machine-readable line per step, e.g. `PROGRESS searching` or `PROGRESS reading 3/20`."""
+    print(f"PROGRESS {step}", flush=True)
+
+
 # --- the steps ------------------------------------------------------------------------------
 
 
@@ -111,6 +154,7 @@ def open_external_search(page: Page, app_url: str, headless: bool) -> None:
         timeout=PAGE_TIMEOUT * 1000,
     )
     if on_login_page(page):
+        progress("logging_in")
         log_in(page, headless)
         page.goto(search_url)
     page.locator("#integrated-search-query").wait_for(timeout=PAGE_TIMEOUT * 1000)
@@ -148,20 +192,33 @@ def log_in(page: Page, headless: bool) -> None:
             lambda url: not urlparse(url).path.startswith("/login"), timeout=wait_for_login * 1000
         )
     except PlaywrightTimeout:
-        sys.exit(
+        raise RunStopped(
+            "login_failed",
             "Login did not complete. Check EXCELHIRE_EMAIL / EXCELHIRE_PASSWORD in .env, or run "
-            "once with --show and log in in the window."
-        )
+            "once with --show and log in in the window.",
+        ) from None
+
+
+CREDITS_PATTERN = re.compile(r"Available credits\s*(\d+)")
+CREDITS_TIMEOUT = 15  # seconds; right after a login the counter can take a moment to appear
 
 
 def available_credits(page: Page) -> int | None:
-    match = re.search(r"Available credits\s*(\d+)", page.inner_text("body"))
+    """The credit counter as shown, waiting briefly for it; None if it never appears."""
+    try:
+        page.get_by_text(re.compile(r"Available credits")).first.wait_for(
+            timeout=CREDITS_TIMEOUT * 1000
+        )
+    except PlaywrightTimeout:
+        return None
+    match = CREDITS_PATTERN.search(page.inner_text("body"))
     return int(match.group(1)) if match else None
 
 
 def run_search(page: Page, jd: str, mode: str) -> str:
     """Choose the mode, paste the JD, wait for Excel Hire to turn it into filters, run the search.
     Returns the "Total matches" figure as shown."""
+    progress("parsing")
     page.locator("button.search-mode__option", has_text=mode).first.click()
     page.locator("#integrated-search-query").fill(jd)
 
@@ -172,6 +229,7 @@ def run_search(page: Page, jd: str, mode: str) -> str:
         page.get_by_role("button", name="Parse Filters").click()
         filters_ready.wait_for(timeout=FILTERS_TIMEOUT * 1000)
 
+    progress("searching")
     page.locator("button.integrated-btn--primary", has_text="Run Search").click()
     total = page.locator(".integrated-search-total-pill")
     total.wait_for(timeout=RESULTS_TIMEOUT * 1000)
@@ -185,7 +243,9 @@ def read_candidates(page: Page, count: int) -> list[dict[str, str]]:
     rows = page.locator(RESULT_ROW)
     check_table_shape(rows.first)
     candidates = []
-    for index in range(min(count, rows.count())):
+    wanted = min(count, rows.count())
+    for index in range(wanted):
+        progress(f"reading {index + 1}/{wanted}")
         row = rows.nth(index)
         name_cell = row.locator(CELL["name"])
         score_cell = row.locator(CELL["score"])
@@ -216,6 +276,40 @@ def save_excel(candidates: list[dict[str, str]], jd: str, mode: str, total: str)
     path = OUTPUT_FOLDER / f"excelhire_{slug(jd)}_{datetime.now():%Y%m%d-%H%M%S}.xlsx"
     workbook.save(path)
     return path
+
+
+def save_csv(candidates: list[dict[str, str]], path: Path) -> Path:
+    """The LeadOps CSV: CSV_COLUMNS, one row per candidate, UTF-8. Skills stay comma-separated;
+    experience, education and the match reasons keep one entry per line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for candidate in candidates:
+            writer.writerow(csv_row(candidate))
+    return path
+
+
+def csv_row(candidate: dict[str, str]) -> dict[str, str | int]:
+    first_name, last_name = split_name(candidate["Name"])
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "linkedin_url": candidate["LinkedIn"],
+        "location": candidate["Location"],
+        "company": candidate["Company"],
+        "skills": candidate["Skills"],
+        "experience": candidate["Experience"],
+        "education": candidate["Education"],
+        "match_score": excel_value(candidate, "Score (%)", 0),
+        "match_reasons": excel_value(candidate, "Why matched", 0),
+    }
+
+
+def split_name(name: str) -> tuple[str, str]:
+    """'Y Rajesh' -> ('Y', 'Rajesh'); 'Anu' -> ('Anu', ''); extra words stay in the last name."""
+    first, _, last = " ".join(name.split()).partition(" ")
+    return first, last
 
 
 def write_candidates_sheet(sheet: Worksheet, candidates: list[dict[str, str]]) -> None:
@@ -316,7 +410,10 @@ def check_table_shape(first_row: Locator) -> None:
     """Stop, rather than write the wrong columns, if Excel Hire has changed its table."""
     missing = [field for field, selector in CELL.items() if not first_row.locator(selector).count()]
     if missing or not first_row.locator("a.candidate-link").count():
-        sys.exit(f"The results table has changed (missing: {', '.join(missing) or 'name link'}).")
+        raise RunStopped(
+            "table_changed",
+            f"The results table has changed (missing: {', '.join(missing) or 'name link'}).",
+        )
 
 
 def expanded_lines(cell: Locator) -> list[str]:
@@ -358,35 +455,66 @@ def main() -> None:
     parser.add_argument(
         "--show", action="store_true", help="show the browser window (hidden by default)"
     )
+    parser.add_argument(
+        "--csv", type=Path, help="also write the LeadOps CSV (CSV_COLUMNS) to this path"
+    )
     args = parser.parse_args()
+    try:
+        outcome = search(args)
+    except RunStopped as stopped:
+        print(stopped, flush=True)
+        outcome = stopped.outcome
+    except PlaywrightTimeout as error:
+        print(f"Excel Hire did not answer in time: {error}", flush=True)
+        outcome = "timed_out"
+    sys.exit(EXIT_CODES[outcome])
 
+
+def search(args: argparse.Namespace) -> str:
+    """The whole run; returns how it ended (a key of EXIT_CODES)."""
+    if not args.jd_file.is_file():
+        raise RunStopped("bad_input", f"No such file: {args.jd_file}")
     jd = args.jd_file.read_text(encoding="utf-8").strip()
     if len(jd) < MIN_JD_LENGTH:
-        sys.exit(f"The job description must be at least {MIN_JD_LENGTH} characters.")
+        raise RunStopped(
+            "bad_input", f"The job description must be at least {MIN_JD_LENGTH} characters."
+        )
     if args.count > ROWS_ON_FIRST_PAGE:
         print(f"Only the first page is read: at most {ROWS_ON_FIRST_PAGE} profiles.")
 
     load_dotenv(HERE / ".env")
     app_url = os.getenv("EXCELHIRE_URL", "https://product.excelhire.com").rstrip("/")
 
+    progress("opening")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch_persistent_context(
             PROFILE_FOLDER, headless=not args.show, viewport={"width": 1600, "height": 900}
         )
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        open_external_search(page, app_url, headless=not args.show)
-        credits_before = available_credits(page)
-        total = run_search(page, jd, args.mode)
-        candidates = read_candidates(page, args.count)
-        credits_after = available_credits(page)
-        browser.close()
+        try:
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            open_external_search(page, app_url, headless=not args.show)
+            credits_before = available_credits(page)
+            total = run_search(page, jd, args.mode)
+            candidates = read_candidates(page, args.count)
+            credits_after = available_credits(page)
+        finally:
+            browser.close()
 
+    progress("saving")
     path = save_excel(candidates, jd, args.mode, total)
     print(f"{len(candidates)} profiles saved to {path}  (total matches: {total})")
-    if credits_before != credits_after:
+    if args.csv:
+        print(f"LeadOps CSV saved to {save_csv(candidates, args.csv)}")
+    if credits_before is None or credits_after is None:
+        # A counter that could not be read is not a change; say so instead of raising an alarm.
+        print(f"Credits could not be verified (before: {credits_before}, after: {credits_after}).")
+    elif credits_before != credits_after:
         print(f"WARNING: credits changed from {credits_before} to {credits_after}.")
+        return "credits_changed"
     else:
         print(f"Credits unchanged: {credits_after}.")
+    progress("done")
+    return "ok"
 
 
 if __name__ == "__main__":
